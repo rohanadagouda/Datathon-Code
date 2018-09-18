@@ -1,0 +1,255 @@
+#download packages
+pkgs <- c("tidyverse","RMariaDB","Hmsic","lubridate","hms","magicfor",
+          "cluster","caTools","xgboost","ramify","Matrix","tictoc","Metrics")
+for (pkg in pkgs) {
+  if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg,dependencies = TRUE) }
+}
+setwd("/home/rohan/R")
+rm(list = ls())
+library(tidyverse)
+library(RMariaDB)
+library(cluster)
+library(caTools)
+library(Matrix)
+library(ramify)
+library(lubridate)
+library(hms)
+library(magicfor)
+library(Metrics)
+#Connect to Maria DB====================
+db_connection <- dbConnect(MariaDB(),
+            user="mathemagician", password="myki",
+            dbname="myki",
+            host="127.0.0.1",
+            port = 3306
+  )
+
+summary(db_connection)
+dbListTables(db_connection)
+# dbDisconnect(db_connection)
+
+#Factor Levels============
+WeekNo= seq(1,53,by=1)
+Month= seq(1,12,by=1)
+DayLevels =  c("Monday","Tuesday","Wednesday","Thursday", "Friday","Saturday",
+               "Sunday")
+Quarter= seq(1,4,by=1)
+
+StopIDLevels =scan("Stop_IDs.txt",integer())
+
+
+#Extract the Data from MariaDB===========
+
+Data = dbGetQuery(db_connection,"select DATE(date_time30) as DATE,
+                                            MONTH(date_time30) as MONTH,
+                                            DAYNAME(date_time30) as DAY,
+                                         WEEKOFYEAR(date_time30) as WEEKNUMBER,
+                                            TIME(date_time30)as TIME,
+                                            ronen_id,stop_id,my_count
+                                            from r30_10
+                  where ronen_id = 2;")
+
+#head(Data,3)
+set.seed(363636)
+magic_for(func = put)
+for (z in 101:110) {
+  print(z)
+#Read the Data
+DATES=ymd("2015-07-01")+6+z
+DATES
+Train_Sample= subset(Data,Data$DATE<=DATES & Data$stop_id %in% c(64401,64402,
+                                                                 64403,64404,
+                                                                 64405,64406,
+                                                                 64407,64408))
+Train_Sample$stop_id= factor(Train_Sample$stop_id,levels = StopIDLevels)
+Train_Sample$MONTH=factor(Train_Sample$MONTH,levels =Month)
+Train_Sample$DAY=factor(Train_Sample$DAY,levels =DayLevels)
+Train_Sample$WEEKNUMBER=factor(Train_Sample$WEEKNUMBER,levels = WeekNo)
+Train_Sample$ronen_id=NULL
+
+#Test Data
+DATES_Test=DATES+7
+DATES_Test
+Test_Sample=subset(Data,Data$DATE>DATES & Data$DATE<=DATES_Test & Data$stop_id %in% c(64401,64402,
+                                                                                     64403,64404,
+                                                                                     64405,64406,
+                                                                                     64407,64408))
+Test_Sample$stop_id= factor(Test_Sample$stop_id,levels = StopIDLevels)
+Test_Sample$MONTH=factor(Test_Sample$MONTH,levels =Month)
+Test_Sample$DAY=factor(Test_Sample$DAY,levels =DayLevels)
+Test_Sample$WEEKNUMBER=factor(Test_Sample$WEEKNUMBER,levels = WeekNo)
+Test_Sample$ronen_id=NULL
+
+#Xgboost===========
+library(xgboost)
+gc(reset = TRUE)
+y <- Train_Sample$my_count
+y_ts =Test_Sample$my_count
+new_tr <- sparse.model.matrix(my_count ~ .-1, data =Train_Sample)
+new_ts <- sparse.model.matrix(my_count ~ .-1, data =Test_Sample)
+#preparing matrix
+dtrain <- xgb.DMatrix(data = new_tr ,label = y)
+dtest <- xgb.DMatrix(data = new_ts ,label = y_ts)
+
+min_mae = Inf
+#Search for Max_Depth and min_child_weight==================================
+for (i in 1:30) {
+  for (j in 1:2) {
+    print(paste0("CV with max_depth=", i," min_child_weight=", j))
+    params <- list(
+      booster = "gbtree",
+      objective = "reg:linear",
+      eta=0.2,
+      gamma=0,
+      max_depth=i,
+      min_child_weight=j,
+      subsample=1,
+      colsample_bytree=1
+    )
+    #cross-validate
+    xgbcv <- xgb.cv(params = params
+                    ,data = dtrain
+                    ,nthread = 8
+                    ,nrounds = 99999
+                    ,nfold = 5
+                    ,metrics = ("mae")
+                    ,verbose = 0
+                    ,showsd = TRUE
+                    ,early_stopping_rounds = 10
+                    ,maximize = FALSE
+    )
+    mean_mae=min(xgbcv$evaluation_log[,4])
+    MAE= data.frame(xgbcv$evaluation_log[,4])
+    mat=which(MAE==min(MAE),arr.ind=TRUE)
+    boost_rounds=rownames(MAE)[mat[,1]]
+    print(paste0("MAE=", mean_mae," round=", boost_rounds))
+    if (mean_mae < min_mae) {
+      min_mae = mean_mae
+      Best_max_depth=i
+      Best_min_child_weight=j
+    }
+  }
+}   
+print(paste0("Best_max_depth: ",Best_max_depth," Best_min_child_weight: ",Best_min_child_weight," min_mae: ",min_mae))
+
+
+#Search for subsample  and colsample_bytree==============================
+min_mae= Inf
+A <- seq(0.8, 1, by = 0.1)
+B <- seq(0.9, 1, by = 0.1)
+for (i in A) {
+  for (j in B) {
+    
+    print(paste0("CV with subsample=", i," colsample_bytree=", j))
+    
+    params <- list(
+      booster = "gbtree",
+      objective = "reg:linear",
+      eta=0.2,
+      gamma=0,
+      max_depth=Best_max_depth,
+      min_child_weight=Best_min_child_weight,
+      subsample=i,
+      colsample_bytree=j
+    )
+    #cross-validate
+    xgbcv <- xgb.cv(params = params
+                    ,data = dtrain
+                    ,nrounds = 99999
+                    ,nthread = 8
+                    ,nfold = 5
+                    ,metrics = ("mae")
+                    ,verbose = 0
+                    ,showsd = TRUE
+                    ,early_stopping_rounds = 10
+                    ,maximize = FALSE
+    )
+    mean_mae=min(xgbcv$evaluation_log[,4])
+    MAE= data.frame(xgbcv$evaluation_log[,4])
+    mat=which(MAE==min(MAE),arr.ind=TRUE)
+    boost_rounds=rownames(MAE)[mat[,1]]
+    print(paste0("MAE=", mean_mae," round=", boost_rounds))
+    if (mean_mae < min_mae) {
+      min_mae = mean_mae
+      Best_subsample=i
+      Best_colsample_bytree=j
+    }
+  }
+}   
+print(paste0("Best_subsample: ",Best_subsample," Best_colsample_bytree: ",Best_colsample_bytree," min_mae: ",min_mae))
+
+
+#Search for ETA=============================
+require(tictoc)
+min_mae = Inf
+A= c(0.01, 0.1)
+for (i in A) {
+  print(paste0("CV with eta=", i," nrounds=", j))
+  tic(msg = "Start",quiet = FALSE)
+  params <- list(
+    booster = "gbtree",
+    objective = "reg:linear",
+    eta=i,
+    max_depth=Best_max_depth,
+    min_child_weight=Best_min_child_weight,
+    subsample=Best_subsample,
+    colsample_bytree=Best_colsample_bytree
+  )
+  #cross-validate
+  xgbcv <- xgb.cv(params = params
+                  ,data = dtrain
+                  ,nthread = 8
+                  ,nrounds = 99999
+                  ,nfold = 5
+                  ,metrics = ("mae")
+                  ,verbose = 0
+                  ,showsd = TRUE
+                  ,early_stopping_rounds = 10
+                  ,maximize = FALSE
+  )
+  
+  toc(quiet = FALSE)
+  tic.clear()
+  mean_mae=min(xgbcv$evaluation_log[,4])
+  MAE= data.frame(xgbcv$evaluation_log[,4])
+  mat=which(MAE==min(MAE),arr.ind=TRUE)
+  boost_rounds=rownames(MAE)[mat[,1]]
+  print(paste0("MAE=", mean_mae," round=", boost_rounds))
+  if (mean_mae < min_mae) {
+    min_mae = mean_mae
+    Best_eta=i
+  }
+}
+print(paste0("Best_eta: ",Best_eta," min_mae: ",min_mae," nrounds: ",boost_rounds))
+
+# ====================================================================
+#Updated Values
+params <- list(
+  booster = "gbtree",
+  objective = "reg:linear",
+  eta=Best_eta,
+  gamma=0,
+  max_depth=Best_max_depth,
+  min_child_weight=Best_min_child_weight,
+  subsample=Best_subsample,
+  colsample_bytree=Best_colsample_bytree
+)
+
+#first default - model training
+xgb1 <- xgb.train(
+  params = params
+  ,data = dtrain
+  ,nrounds = 99999
+  ,watchlist = list(train=dtrain)
+  ,eval_metric = "mae"
+  ,early_stopping_rounds = 10
+)
+#Predict
+y_pred <- predict(xgb1,dtest)
+#WAPE
+WAPE =mae(Test_Sample$my_count,y_pred)/(sum(Test_Sample$my_count)/NROW(Test_Sample))
+put(z,DATES,DATES_Test,Best_eta,Best_max_depth,
+    Best_min_child_weight,Best_subsample,Best_colsample_bytree,WAPE)
+}
+WAPE_List =magic_result_as_dataframe()
+write.csv(WAPE_List,"WAPE.csv")
